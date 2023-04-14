@@ -1,0 +1,8 @@
+dev/
+venv/
+.ipynb_checkpoints/
+data/
+*.db
+*.csv
+*.pkl
+*.parquet
