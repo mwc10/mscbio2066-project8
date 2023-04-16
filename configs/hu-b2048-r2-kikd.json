@@ -1,0 +1,16 @@
+{
+    "kinases": {
+        "file": "data/map-uniprot-seq.tsv",
+        "species": ["Human"]
+    },
+    "fingerprints": {
+        "file": "data/map-ecfp2.pkl",
+        "bitSize": 2048,
+        "radius": 2,
+        "useFeatures": false,
+        "useChirality": false
+    },
+    "activityTypes": ["KD", "KI"],
+    "cvIterations": 150,
+    "minCompounds": 30
+}
