@@ -4,12 +4,14 @@ import polars as pl
 from pathlib import Path
 import json
 import argparse
+import tarfile
 
 def cli() -> argparse.Namespace:
     p = argparse.ArgumentParser(usage='Bundle Config and Metric CSV into folder')
     p.add_argument('--model_base', '-m', required=True, help='Dir with model UBJ')
     p.add_argument('--config', '-c', required=True, help='Training Config')
     p.add_argument('--data', '-d', required=True, help='Training Data Directory')
+    p.add_argument('--tar', '-t', action='store_true', help='Store all model files into a .tar')
     
     return p.parse_args()
 
@@ -17,7 +19,8 @@ def cli() -> argparse.Namespace:
 def main(args: argparse.Namespace):
     base = Path(args.model_base)
     data = Path(args.data)
-    config = json.load(open(args.config, 'rt'))
+    cf = Path(args.config)
+    config = json.load(open(cf, 'rt'))
 
     # filter squences to what's needed
     sequences = (
@@ -43,6 +46,13 @@ def main(args: argparse.Namespace):
     info.write_csv(output)
     with open(base/'config.json', 'wt') as f:
         json.dump(config, f) 
+
+    if args.tar:
+        tarout = Path('model_'+cf.stem).with_suffix('.tar.gz')
+        with tarfile.open(tarout, 'w:gz') as f:
+            f.add(base)
+        print(tarout)
+
 
 if __name__ == '__main__':
     args = cli()

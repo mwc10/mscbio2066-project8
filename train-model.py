@@ -114,7 +114,7 @@ def main(args):
     Y = df[ACTIVITY].to_numpy()
     # https://github.com/scikit-optimize/scikit-optimize/issues/1138#issuecomment-1467698866
     np.int = int
-    xgbr = xgb.XGBRegressor(tree_method='hist')
+    xgbr = xgb.XGBRegressor(tree_method='hist', random_state=42)
     opt = BayesSearchCV(
         xgbr,
         {
