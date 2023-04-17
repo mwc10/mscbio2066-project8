@@ -50,7 +50,9 @@ def main(args: argparse.Namespace):
     if args.tar:
         tarout = Path('model_'+cf.stem).with_suffix('.tar.gz')
         with tarfile.open(tarout, 'w:gz') as f:
-            f.add(base)
+            f.add(output, arcname=output.name)
+            f.add(cf, arcname=cf.name)
+            f.add(base/'models', arcname='models')
         print(tarout)
 
 
