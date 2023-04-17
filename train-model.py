@@ -66,12 +66,6 @@ def main(args):
     ROUNDS = args.rounds if args.rounds is not None else info['optRounds']
     IDX = args.prot_idx
 
-    # Check if model is already created
-    outModel, outMetrics = name_outputs(args.output, IDX)
-    if outModel.exists() and not args.force:
-        print(f'Model for {targetUniprot} already exists: {outModel}')
-        return 0
-    
     # Format file paths
     DATA_DIR = Path(args.data_dir)
     kinaseTSV = DATA_DIR / info['kinases']['file']
@@ -85,6 +79,12 @@ def main(args):
         return -1
     METRICS['index'] = IDX
     METRICS['uniprot'] = targetUniprot
+
+    # Check if model is already created
+    outModel, outMetrics = name_outputs(args.output, IDX)
+    if outModel.exists() and not args.force:
+        print(f'Model for {targetUniprot} already exists: {outModel}')
+        return 0
 
     print(f'Running for {ROUNDS} rounds for Kinase {targetUniprot} (#{IDX}) with {CORES} cores')
 

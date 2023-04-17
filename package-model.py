@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 import polars as pl
 
-
 from pathlib import Path
 import json
 import argparse
