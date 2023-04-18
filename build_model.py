@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 
 from pathlib import Path
-import polars as pl
+# import polars as pl
+import pandas as pd
 import numpy as np
 import numpy.typing as npt
 import xgboost as xgb
@@ -10,10 +11,10 @@ from Bio import Align
 import requests
 
 import json
-from typing import IO, Dict, List, Sequence, Tuple, Union
+from typing import IO, Dict, List, Sequence, Union
 import heapq
-from itertools import chain
 import tarfile
+import multiprocessing
 
 class Model:
     def __init__(self,
@@ -26,7 +27,8 @@ class Model:
             r.load_model(b)
             r.set_params(n_jobs=cores)
             return r
-        # TODO: Check tar to see if local path or bytes?
+        
+        # Check tar to see if path, otherwise fileobject
         if type(tar) is str or type(tar) is Path:
             openParams = {'name': tar, 'mode':'r'}
         else:
@@ -39,7 +41,7 @@ class Model:
         with tarfile.open(**openParams) as tf:
             ubj_bytes = lambda p: bytearray(tf.extractfile(p).read())
             configure = lambda tup: (tup[0], {'models': [load_model(ubj_bytes(tup[1]))], 'seq': tup[2]})
-            df = pl.read_csv(tf.extractfile('info.csv').read())
+            df = pd.read_csv(tf.extractfile('info.csv'))
             itr = zip(df['uniprot'], df['output_model'], df['sequence'])
 
             self.protModels = dict(map(configure, itr))
@@ -66,12 +68,17 @@ class Model:
     def predict_batch(self, smiles: Sequence[str], uniprot: Sequence[str]) -> List[float]:
         unique_smiles = set(smiles)
         novel_uniprot = set(uniprot).difference(set(self.protModels.keys()))
-        print('total unique smiles', len(unique_smiles), 'out of', len(smiles))
-        print('total novel uniprot', len(novel_uniprot))
+        print('total unique smiles', len(unique_smiles), '/', len(smiles))
+        print('total novel uniprot', len(novel_uniprot), '/', len(uniprot))
 
         # Ideally this would all be done with multiprocessing...
         novel_seqs = self.fetch_seqs(novel_uniprot)
         print('got novel sequences from uniprot API')
+        # with multiprocessing.Pool(self.cores) as p:
+        #     models = p.map(self.get_similar, novel_seqs.values())
+        #     for (uid, seq), m in zip(novel_seqs.items(), models):
+        #         self.protModels[uid] = {'models': m, 'seq': seq}
+
         for uid, seq in novel_seqs.items():
             models = self.get_similar(seq)
             self.protModels[uid] = {'models': models, 'seq': seq}
@@ -99,28 +106,6 @@ class Model:
 
         return np.array(fp, dtype=np.uint8)
 
-    def predict_array(self, smiles: Sequence[str], uniprot: Sequence[str]) -> List[float]:
-        # smiles to featurize
-        novel_smiles = set(smiles)
-        # get set of uniprot strings not already known
-        novel_uniprots = set(uniprot).difference(chain(self.knownModels.keys(), self.similarModels.keys()))
-        novel_uniprots = self.fetch_seqs(novel_uniprots)
-        # with a pool, fingerprint all novel smiles and request seqs for novel uniprots
-        smilesToFP = {s: self.fingerprint(s).reshape(1, -1) for s in novel_smiles}
-        for uid, seq in novel_uniprots.items():
-            self.similarModels[uid] = self.get_similar(seq)
-            
-
-        # then, get iterator of (fp, models) to run predictions
-        for smiles, uniprot in zip(smiles, uniprot):
-            fp = smilesToFP[smiles]
-            if uniprot in self.knownModels:
-                return self.knownModels[uniprot].predict(fp)
-            elif uniprot in self.similarModels:
-                return np.mean([m.predict(fp) for m in self.similarModels[uniprot]])
-            else:
-                raise Exception('no model for', uniprot)
-
     def fetch_seqs(self, uids: Sequence[str]) -> Dict[str, str]:
         url = 'https://rest.uniprot.org/uniprotkb/stream'
         query = " OR ".join(f'(accession:{uid})' for uid in uids)
@@ -141,3 +126,39 @@ class Model:
 
         return [x[1] for x in heapq.nlargest(self.topK, itr, key=lambda x: x[0])]
 
+if __name__ == '__main__':
+    import argparse
+    import fsspec
+    import os
+
+    def cli():
+        p = argparse.ArgumentParser('Run model in `tarfile` on `datafile`')
+        p.add_argument('input', help='input columnar data file with SMILES and UniProt IDs')
+        p.add_argument('output', nargs='?', default=None, help="save DF to file, or print to stdout if not present")
+        p.add_argument('--tarfile', '-t', default='gs://mwc10-mscbio2066/model_hu-b2048-r2-kikd.tar.gz', help='tar containing model info')
+        p.add_argument('--eval', '-e', action='store_true')
+        return p.parse_args()
+    
+    def get_num_cores():
+        try:
+            return len(os.sched_getaffinity(0))
+        except:
+            return multiprocessing.cpu_count()
+    
+    args = cli()
+    cores = get_num_cores()
+    df = pd.read_csv(args.input, sep=' ').dropna(axis='columns', how='all')
+    print(f'creating model for {args.tarfile}')
+    with fsspec.open(args.tarfile) as tar:
+        m = Model(tar, cores)
+    predictions = m.predict_batch(df['SMILES'], df['UniProt'])
+    df['Predicted'] = pd.Series(np.array(predictions), dtype=float)
+    # test = df.with_columns([pl.Series('Predict pKd', predictions, dtype=pl.Float64)])
+    if args.output is not None:
+        df.to_csv(args.output, sep=' ', float_format='%.4f', index=False)
+        print('saved predictions to ', args.output)
+
+    if 'pKd' in df and args.eval:
+        print(df)
+        corr = np.corrcoef(df['Predicted'], df['pKd']).min()
+        print(f'Correlation with labels in input:\t{corr:.4f}')
