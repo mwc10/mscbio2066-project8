@@ -39,19 +39,21 @@ def main(args: argparse.Namespace):
 
     del config['fingerprints']['file']
     del config['kinases']['file']
+    config['name'] = cf.stem
 
     print(info)
     print(config)
     output = base/ 'info.csv'
+    outConf = base / 'config.json'
     info.write_csv(output)
-    with open(base/'config.json', 'wt') as f:
+    with open(outConf, 'wt') as f:
         json.dump(config, f) 
 
     if args.tar:
         tarout = Path('model_'+cf.stem).with_suffix('.tar.gz')
         with tarfile.open(tarout, 'w:gz') as f:
             f.add(output, arcname=output.name)
-            f.add(cf, arcname=cf.name)
+            f.add(outConf, arcname='config.json')
             f.add(base/'models', arcname='models')
         print(tarout)
 
