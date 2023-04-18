@@ -1,5 +1,6 @@
 dev/
 venv/
+__pycache__/
 .ipynb_checkpoints/
 data/
 test/
