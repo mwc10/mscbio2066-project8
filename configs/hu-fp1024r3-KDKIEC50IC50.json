@@ -1,0 +1,23 @@
+{
+    "kinases": {
+        "file": "map-uniprot-seq.tsv",
+        "species": [
+            "Human"
+        ]
+    },
+    "fingerprints": {
+        "file": "ecfp-r3-b1024.pkl",
+        "bitSize": 1024,
+        "radius": 3,
+        "useFeatures": false,
+        "useChirality": false
+    },
+    "dataFile": "full-median.parquet",
+    "activityTypes": [
+        "KD",
+        "KI",
+        "EC50",
+        "IC50"
+    ],
+    "optRounds": 150
+}
