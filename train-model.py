@@ -15,6 +15,8 @@ import multiprocessing
 from typing import Dict, Tuple, List, Optional
 from pathlib import Path
 
+MIN_COMPOUNDS = 10
+
 def cli() -> argparse.Namespace:
     p = argparse.ArgumentParser(description='Train an XGBoost model for a kinase')
     p.add_argument('--prot_idx', '-i', type=int, required=True)
@@ -43,7 +45,8 @@ def name_outputs(base: str, idx: int) -> Tuple[Path, Path]:
     metrics.mkdir(parents=True, exist_ok=True)
     return (
         models / f'{idx:>05}.ubj',
-        metrics / f'{idx:>05}.csv'
+        metrics / f'{idx:>05}.csv',
+        metrics / f'cvres-{idx:>05}.csv'
     )
 
 def print_metrics(metrics: Dict):
@@ -81,12 +84,11 @@ def main(args):
     METRICS['uniprot'] = targetUniprot
 
     # Check if model is already created
-    outModel, outMetrics = name_outputs(args.output, IDX)
+    outModel, outMetrics, outRes = name_outputs(args.output, IDX)
     if outModel.exists() and not args.force:
         print(f'Model for {targetUniprot} already exists: {outModel}')
         return 0
 
-    print(f'Running for {ROUNDS} rounds for Kinase {targetUniprot} (#{IDX}) with {CORES} cores')
 
     # get the ChemBL IDs and Activities for this kinase
     CCID = 'compound_chembl_id'
@@ -101,10 +103,12 @@ def main(args):
         .collect()
     )
     METRICS['num_compounds'] = df.height
-    if df.height < info['minCompounds']:
-        print(f'Too few compounds to train:\n{df.height} (min {info["minCompounds"]})')
+    
+    if df.height < MIN_COMPOUNDS:
+        print(f'Too few compounds to train {targetUniprot} (#{IDX}):\n{df.height} (min {MIN_COMPOUNDS})')
         return -1
 
+    print(f'Running for {ROUNDS} rounds for Kinase {targetUniprot} (#{IDX}) with {CORES} cores for {df.height} CMPDs')
     # Convert ChemBl IDs to precomputed fingerprints for features
     with open(cmpdFPs, 'rb') as f:
         idToFP = pickle.load(f)
@@ -118,23 +122,29 @@ def main(args):
     opt = BayesSearchCV(
         xgbr,
         {
-            'n_estimators': (1, 500),
-            'max_depth': (1, 10),
+            'n_estimators': (50, 600),
+            'learning_rate': (0.0, 0.3),
+            'gamma': (1e-2, 1e1, 'log-uniform'),
+            'min_child_weight': (1, 1e3, 'log-uniform'),
+            'max_depth': (1, 8),
             'max_leaves': (0, 20),
-            'subsample': (0.5, 1.0, 'uniform'),
+            'subsample': (0.6, 1.0, 'uniform'),
         },
-        scoring='neg_root_mean_squared_error',
+        scoring='r2',
         n_iter=ROUNDS,
         cv=5,
         n_jobs=CORES,
-        n_points=2,
+        n_points=3,
+        optimizer_kwargs={'n_initial_points':35},
+        refit=False,
     )
+    print('Total Iterations', opt.total_iterations)
     opt.fit(X, Y)
     for k, v in opt.best_params_.items(): METRICS[k] = v
     METRICS['bayes_best_score'] = opt.best_score_
 
     # Retrain final model to save it...?
-    final = xgb.XGBRegressor(n_jobs=CORES, tree_method='hist', **opt.best_params_)
+    final = xgb.XGBRegressor(n_jobs=CORES, tree_method='hist', random_state=42, **opt.best_params_)
     final.fit(X, Y)
     METRICS['rmse'] = -cross_val_score(final, X, Y, scoring='neg_root_mean_squared_error').mean()
     METRICS['r2'] = cross_val_score(final, X, Y, scoring='r2').mean()
@@ -145,6 +155,15 @@ def main(args):
     final.save_model(outModel)
     pl.DataFrame(METRICS).write_csv(outMetrics)
     print_metrics(METRICS)
+    converted = {k: v if type(v) is not np.ma.MaskedArray else v.filled().astype(float) for (k, v) in opt.cv_results_.items()}
+    cvres = (
+        pl.DataFrame(converted)
+        .with_columns([pl.Series('uniprot', [targetUniprot]), pl.Series('num_compounds', [df.height])])
+        .drop('params')
+        .sort(by='rank_test_score')
+    )
+    cvres.write_csv(outRes)
+    print(cvres.select('mean_fit_time', 'mean_test_score').head(5))
 
 if __name__ == "__main__":
     args = cli()
