@@ -24,7 +24,7 @@ def make_config(radius, bits, acts):
         'fingerprints': make_fp(radius, bits),
         'dataFile': 'full-median.parquet',
         'activityTypes': acts,
-        'optRounds': 150,
+        'optRounds': 100,
     }
 
 def make_fname(radius, bits, acts):

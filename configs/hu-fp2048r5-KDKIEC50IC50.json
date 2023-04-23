@@ -19,5 +19,5 @@
         "EC50",
         "IC50"
     ],
-    "optRounds": 150
+    "optRounds": 100
 }

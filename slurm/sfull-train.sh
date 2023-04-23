@@ -42,8 +42,8 @@ for DS in "${DATASETS[@]}"; do
     OUTPUT=models/${NAME}
 
     echo -------------------
-    echo Running $DS for FP $RADIUS over $N_CMPDS
-    
+    echo Running $DS for FP $RADIUS over $DS
+
     python3 ${WD}/train-model.py -i ${SLURM_ARRAY_TASK_ID} -j ${CONFIG} -d ${DATA} -o ${OUTPUT}
   done
 done
