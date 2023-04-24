@@ -14,7 +14,7 @@ RADII=(1 2 3 5 7 9 11)
 ### Job Local Directory Setup
 WD=${SLURM_SUBMIT_DIR}
 USER=$(whoami)
-JOB_DIR=/scr/${USER}/p8
+JOB_DIR=/scr/${USER}_${SLURM_JOB_ID}
 # copy data over
 mkdir -p ${JOB_DIR}
 cd ${JOB_DIR}
@@ -24,8 +24,8 @@ rsync -av ${WD}/sync/* .
 trap "echo 'copying back on exit'; rsync -av * ${WD}/sync" EXIT
 
 ### MAIN ####
-echo ${SLURM_JOB_NAME}  allocated to ${SLURM_NODELIST}
-
+echo ${SLURM_JOB_NAME} allocated to ${SLURM_NODELIST}
+echo JOB_DIR ${JOB_DIR}
 
 # activate modules
 module load anaconda

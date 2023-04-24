@@ -32,9 +32,14 @@ def main(args: argparse.Namespace):
         ).unique(subset='uniprot')
     )
     info = (
-        pl.scan_csv(str(base / 'metrics' / '*.csv'))
+        pl.scan_csv(str(base / 'metrics' / '[0-9]*.csv'))
         .join(sequences, on='uniprot', how='left')
     ).collect()
+
+    cvres = (
+        pl.scan_csv(str(base / 'metrics' / 'cvres-*.csv'))
+        .collect()
+    )
 
 
     del config['fingerprints']['file']
@@ -45,7 +50,9 @@ def main(args: argparse.Namespace):
     print(config)
     output = base/ 'info.csv'
     outConf = base / 'config.json'
+    outCV = base / 'cv-results.csv'
     info.write_csv(output)
+    cvres.write_csv(outCV)
     with open(outConf, 'wt') as f:
         json.dump(config, f) 
 
@@ -54,6 +61,7 @@ def main(args: argparse.Namespace):
         with tarfile.open(tarout, 'w:gz') as f:
             f.add(output, arcname=output.name)
             f.add(outConf, arcname='config.json')
+            f.add(outCV, arcname='cv-results.csv')
             f.add(base/'models', arcname='models')
         print(tarout)
 
