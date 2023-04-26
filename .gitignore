@@ -1,5 +1,6 @@
 dev/
 venv/
+tvenv/
 __pycache__/
 .ipynb_checkpoints/
 data/

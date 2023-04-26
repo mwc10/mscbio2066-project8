@@ -8,11 +8,11 @@ ACTIVITIES = [['KD', 'KI'], ['KD', 'KI', 'EC50'], ['KD', 'KI', 'EC50', 'IC50']]
 
 def make_fp(radius, bits):
     return {
-        'file': f'ecfp-r{radius}-b{bits}.pkl',
+        'file': f'ecfp-r{radius}-b{bits}-cf.pkl',
         'bitSize': bits,
         'radius': radius,
-        'useFeatures': False,
-        'useChirality': False,
+        'useFeatures': True,
+        'useChirality': True,
     }
 
 def make_config(radius, bits, acts):
@@ -28,7 +28,7 @@ def make_config(radius, bits, acts):
     }
 
 def make_fname(radius, bits, acts):
-    return f'hu-fp{bits}r{radius}-{"".join(acts)}.json'
+    return f'hu-fp{bits}r{radius}-{"".join(acts)}-CF.json'
 
 def pair(*args):
     return make_fname(*args), make_config(*args)

@@ -14,7 +14,7 @@ import itertools
 
 def cli() -> argparse.Namespace:
     p = argparse.ArgumentParser()
-    p.add_argument('--data', '-d', required=True)
+    p.add_argument('--data', '-d', required=True, help='parquet data file with standard_inchi')
     p.add_argument('--config', '-c', required=True, help='JSON model file with fingerprints key')
 
     return p.parse_args()
