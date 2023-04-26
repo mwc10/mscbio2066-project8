@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 
-from pathlib import Path
 # import polars as pl
 import pandas as pd
 import numpy as np
@@ -9,12 +8,14 @@ import xgboost as xgb
 from rdkit.Chem import AllChem
 from Bio import Align
 import requests
+from scipy.stats import spearmanr
 
 import json
-from typing import IO, Dict, List, Optional, Sequence, Tuple, Union
 import heapq
 import tarfile
 import multiprocessing
+from pathlib import Path
+from typing import IO, Dict, List, Optional, Sequence, Tuple, Union
 
 class Model:
     def __init__(self,
@@ -43,10 +44,10 @@ class Model:
         # load the kinase specific XGB trees and sequences from the tar archive
         # there is an 'info.csv' that map uniprot ids to trained models and the full sequence
         # a 'config.json' with basic info about the model and the fingerprinting parameters
-        # finally, there is a folder with .ubj files for each uniprot id
+        # finally, there is a folder with XGBoost .ubj files for each uniprot id
         with tarfile.open(**openParams) as tf:
             ubj_bytes = lambda p: bytearray(tf.extractfile(p).read())
-            configure = lambda tup: (tup[0], {'models': [load_model(ubj_bytes(tup[1]))], 'seq': tup[2]})
+            configure = lambda tup: (tup[0], {'models': [load_model(ubj_bytes(tup[1]))], 'seq': tup[2], 'direct': True})
             df = pd.read_csv(tf.extractfile('info.csv'))
 
             # filter trees by training metrics or by number of compounds
@@ -74,11 +75,11 @@ class Model:
         # note that this has to match for pre-calculated scores
         self.aligner = Align.PairwiseAligner(scoring='blastp')
         
-        # preprocess scored sequences for models that either were not made or were filtered
+        # use pre-processed sequence similarity scores to find most similar models for each uniprot id
         if scores is not None:
             self.use_precalced(scores)
 
-        # save metric info to the config
+        # save metric and compount filtering info to the model's config dictionary
         if min_cmpds is not None or metric_val is not None:
             metrics = {
                 'min_cmpds': min_cmpds, 
@@ -102,7 +103,7 @@ class Model:
             seqs = self.fetch_seqs([uniprot])
             for uid, seq in seqs.items():
                 models = self.get_similar(seq)
-                self.protModels[uid] = {'models': models, 'seq': seq}
+                self.protModels[uid] = {'models': models, 'seq': seq, 'direct': False}
 
         return np.mean([m.predict(fp) for m in self.protModels[uniprot]['models']])
 
@@ -125,7 +126,7 @@ class Model:
 
             for uid, seq in novel_seqs.items():
                 models = self.get_similar(seq)
-                self.protModels[uid] = {'models': models, 'seq': seq}
+                self.protModels[uid] = {'models': models, 'seq': seq, 'direct': False}
             if self.verbose: print('found similar models for unique sequences')
 
         fps = {smi: self.fingerprint(smi).reshape(1, -1) for smi in unique_smiles}
@@ -182,16 +183,16 @@ class Model:
                     models.append(self.protModels[nnid]['models'][0])
                 if len(models) >= self.topK: break;
 
-            self.protModels[uid] = {'models': models, 'seq': None}
+            self.protModels[uid] = {'models': models, 'seq': None, 'direct': False}
     
     def describe(self) -> Tuple[int, int]:
         ''' return the number of kinase boosters and inferred kinases '''
         boosters, inferred = 0, 0
         for info in self.protModels.values():
-            if len(info['models']) > 1:
-                inferred += 1
-            else:
+            if info['direct']:
                 boosters += 1
+            else:
+                inferred += 1
         
         return boosters, inferred
 
@@ -208,12 +209,12 @@ if __name__ == '__main__':
     def cli():
         p = argparse.ArgumentParser('Run model in `tarfile` on `datafile`')
         p.add_argument('input', help='input columnar data file with SMILES and UniProt IDs')
-        p.add_argument('output', nargs='?', default=None, help="save DF to file, or print to stdout if not present")
+        p.add_argument('output', nargs='?', default=None, help="save predictions to space-separated text file if present")
         p.add_argument('--tarfile', '-t', default='gs://mwc10-mscbio2066/model_hu-fp2048r3-KDKI.tar.gz', help='tar containing model info')
         p.add_argument('--eval', '-e', action='store_true')
         p.add_argument('--cmin', '-c', type=int, default=16, help='min amount of compounds used to train a kinase GBF')
         p.add_argument('--rmin', '-r', type=float, default=None)
-        p.add_argument('-k', type=int, default=3, help='Infer from K models')
+        p.add_argument('-k', type=int, default=3, help='Infer from K models if kinase not directly trained')
         p.add_argument('--scores', '-s', default=None, help='precalculated kinase similiarities')
         return p.parse_args()
     
@@ -228,6 +229,7 @@ if __name__ == '__main__':
 
     df = pd.read_csv(args.input, sep=' ').dropna(axis='columns', how='all')
 
+    # use pre-calced similarity scores to speed up local testing
     if args.scores:
         # too lazy to rewrite this to use pandas..
         import polars as pl
@@ -236,9 +238,11 @@ if __name__ == '__main__':
         print('parsed pre-calculated scores')
     else:
         scores = None
+    
     print(f'creating model for {args.tarfile}')
     with fsspec.open(args.tarfile) as tar:
         m = Model(tar, cores, scores=scores, min_cmpds=args.cmin, metric_val=args.rmin, similar_k=args.k)
+    
     predictions = m.predict_batch(df['SMILES'], df['UniProt'])
     df['Predicted'] = pd.Series(np.array(predictions), dtype=float)
     # test = df.with_columns([pl.Series('Predict pKd', predictions, dtype=pl.Float64)])
@@ -248,8 +252,9 @@ if __name__ == '__main__':
 
     if 'pKd' in df and args.eval:
         print(df)
-        corr = np.corrcoef(df['Predicted'], df['pKd']).min()
-        print(f'Correlation with labels in input:\t{corr:.4f}')
+        res = spearmanr(df['Predicted'], df['pKd'])
+        corr, p = res.statistics, res.pvalue
+        print(f'Correlation with labels in input:\t{corr:.4f} +/- {p:.4f}')
     
     print(m.describe())
     print(m.config)

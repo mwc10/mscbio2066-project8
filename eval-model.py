@@ -2,6 +2,7 @@ from model import Model
 
 import polars as pl
 import numpy as np
+from scipy.stats import spearmanr
 
 import argparse, multiprocessing as mp
 from itertools import cycle
@@ -16,11 +17,10 @@ def cli():
 
     return p.parse_args()
 
-def record_model_info(m: Model, corrcoef: np.ndarray):
+def record_model_info(m: Model, corrcoef: float):
     boosters, inferred = m.describe()
     c = m.config
     fp = c['fingerprints']
-    cf = corrcoef[0, 1]
     mt = c['metrics']
 
     return {
@@ -36,22 +36,22 @@ def record_model_info(m: Model, corrcoef: np.ndarray):
         'k': m.topK,
         'boosters': boosters,
         'inferred': inferred,
-        'corrcoef': cf,
+        'corrcoef': corrcoef,
     }
 
 def run_prediction(args):
     (mtar, r2min, cmin, k), scores, evals = args
     m = Model(mtar, cores=1, scores=scores, metric_val=r2min, min_cmpds=cmin, verbose=False, similar_k=k)
     predicted = m.predict_batch(evals['SMILES'], evals['UniProt'])
-    coef = np.corrcoef(evals['pKd'], predicted)
-    print(mtar, k, r2min, cmin, coef[0, 1], sep='\t')
+    coef = spearmanr(evals['pKd'], predicted).statistic
+    print(mtar.stem, k, r2min, cmin, coef, sep='\t')
 
     return record_model_info(m, coef)
 
 # Constants
-R2_MIN = [None, -2.0, -1.0, -0.75, -0.5, -0.25, 0.0, 0.25, 0.5]
+R2_MIN = [None, -2.0, -1.0, -0.5, -0.25, 0.0, 0.25, 0.5]
 CMPD_MIN = [10, 15, 30, 60, 120, 240]
-TOPK = [2, 3, 4, 5, 10]
+TOPK = [1, 3, 5, 10]
 
 # main
 def main(args):
@@ -69,7 +69,6 @@ def main(args):
         output = list(p.imap_unordered(run_prediction, itr, chunksize=10))
     
     print('out of pool')
-    # output = [run_prediction(mtar, r2min, cmin) for cmin in CMPD_MIN for r2min in R2_MIN]
     df = pl.from_dicts(output)
     if args.output:
         df.write_csv(args.output)
