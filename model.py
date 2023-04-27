@@ -8,15 +8,107 @@ import xgboost as xgb
 from rdkit.Chem import AllChem
 from Bio import Align
 import requests
+from requests.adapters import HTTPAdapter, Retry
 from scipy.stats import spearmanr
 
+import re
 import json
 import heapq
 import tarfile
 import multiprocessing
+import urllib.parse
 from pathlib import Path
-from typing import IO, Dict, List, Optional, Sequence, Tuple, Union
+from typing import IO, Dict, List, Optional, Sequence, Set, Tuple, Union
+from itertools import cycle
 
+class ModelEnsemble:
+    def __init__(self,
+        params: Sequence[Tuple[str, int, int, float]],
+        cores=1,
+        scores: Optional[Dict[str, List[str]]]=None,
+        verbose=True,
+    ) -> None:
+        ''' Create an ensemble XGBoost tree kinase forset models '''
+        def create_model(m):
+            file, k, cmin, rmin = m
+            with fsspec.open(file) as tar:
+                return Model(tar, cores, scores=scores, min_cmpds=cmin, metric_val=rmin, similar_k=k, verbose=verbose)
+        
+        self.aligner=Align.PairwiseAligner(scoring='blastp')
+        self.cores=cores
+        self.verbose=verbose
+        self.ensemble=list(map(create_model, params))
+
+    def predict(self, 
+        smiles: Sequence[str], 
+        uniprot: Sequence[str]
+    ) -> Tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]]:
+        ''' returns ensemble prediction and matrix of each model's prediction '''
+
+        # preprocess any novel/untrained uniprot ids
+        uids = set(uniprot)
+        self.prefetch_seqs(uids)
+
+        # run predictions for each model in the ensemble, and average
+        predictions = np.array([m.predict_batch(smiles, uniprot) for m in self.ensemble], dtype=float)
+        avg_predict = np.mean(predictions, axis=0)
+
+        return avg_predict, predictions
+
+    def prefetch_seqs(self, uids: Set[str]):
+        '''
+        Each model in the ensemble may have a different set of trained kinases.
+        But, the method for adding an inferred kinase requires the same thing, so
+        this function batches the sequence acquistion and scoring for all novel kinases
+        across all models in the ensemble.
+        '''
+
+        novel_uids = set.union(*[m.missing_boosters(uids) for m in self.ensemble])
+        if len(novel_uids) > 0:
+            if self.verbose:
+                print('found', len(novel_uids), 'novel UniProt IDs')
+            novel_seqs = UniProtQuery(novel_uids).get(verbose=self.verbose)
+            if self.verbose:
+                print('prefetched', len(novel_seqs), 'novel UniProt/Sequence pairs')
+            
+            trained = {}
+            for m in self.ensemble:
+                for uid, info in m.protModels.items():
+                    if info['direct'] and uid not in trained:
+                        trained[uid] = info['seq']
+            if self.verbose:
+                print('built all trained UniProt pairs')
+            
+            # novel_scores: Dict[str, List[str]] = {}
+            # for uid, target in novel_seqs.items():
+            #     scores = [(quid, self.aligner.score(target, query)) for quid, query in trained.items()]
+            #     scores.sort(reverse=True, key=lambda x: x[1])
+            #     scores = [p[0] for p in scores]
+            #     novel_scores[uid] = scores
+            #     if self.verbose: print('scored', uid)
+
+            with multiprocessing.Pool(self.cores) as p:
+                itr = p.imap_unordered(
+                    find_uid_nn, 
+                    zip(novel_seqs.items(), cycle([trained]), cycle([self.aligner]), cycle([self.verbose]))
+                )
+                novel_scores = dict(itr)
+            
+            if self.verbose: print(len(novel_scores), 'scored sequences')
+
+            for m in self.ensemble:
+                m.use_precalced(novel_scores)
+
+def find_uid_nn(args) -> Tuple[str, List[str]]:
+        (uid, target), queries, aligner, verbose = args
+        scores = [(quid, aligner.score(target, query)) for quid, query in queries.items()]
+        scores.sort(reverse=True, key=lambda x: x[1])
+        scores = [x[0] for x in scores]
+
+        if verbose: print('scored', uid, '\t', scores[:5])
+
+        return uid, scores
+    
 class Model:
     def __init__(self,
         tar: Union[str, Path, IO[bytes]],
@@ -46,8 +138,20 @@ class Model:
         # a 'config.json' with basic info about the model and the fingerprinting parameters
         # finally, there is a folder with XGBoost .ubj files for each uniprot id
         with tarfile.open(**openParams) as tf:
-            ubj_bytes = lambda p: bytearray(tf.extractfile(p).read())
-            configure = lambda tup: (tup[0], {'models': [load_model(ubj_bytes(tup[1]))], 'seq': tup[2], 'direct': True})
+            # ubj_bytes = lambda p: bytearray(tf.extractfile(p).read())
+            # configure = lambda tup: (tup[0], {'models': [load_model(ubj_bytes(tup[1]))], 'seq': tup[2], 'direct': True})
+            def ubj_bytes(p):
+                ''' get the decompressed UBJ bytes from the tar.gz file '''
+                return bytearray(tf.extractfile(p).read())
+            def configure(tup):
+                uid, model_path, seq = tup
+                value = {
+                    'models': [load_model(ubj_bytes(model_path))],
+                    'seq': seq,
+                    'direct': True
+                }
+                return (uid, value)
+            # read model information csv from tar.gz
             df = pd.read_csv(tf.extractfile('info.csv'))
 
             # filter trees by training metrics or by number of compounds
@@ -61,8 +165,9 @@ class Model:
                 q = ' and '.join(filter(lambda x: x is not None, [qm, qc]))
                 df = df.query(q)
             
+            # load models into XGBoost with supporting information from info.csv
+            # and save model config.json into class
             itr = zip(df['uniprot'], df['output_model'], df['sequence'])
-
             self.protModels = dict(map(configure, itr))
             self.config = json.load(tf.extractfile('config.json'))
         
@@ -79,18 +184,14 @@ class Model:
         if scores is not None:
             self.use_precalced(scores)
 
-        # save metric and compount filtering info to the model's config dictionary
-        if min_cmpds is not None or metric_val is not None:
-            metrics = {
-                'min_cmpds': min_cmpds, 
-                'metric': metric,
-                'op': metric_op,
-                'val': metric_val,
-                }
-            self.config['metrics'] = metrics
-        else:
-            self.config['metrics'] = None
-
+        # save metric and compound filtering info to the model's config dictionary
+        metrics = {
+            'min_cmpds': min_cmpds, 
+            'metric': metric,
+            'op': metric_op,
+            'val': metric_val,
+            }
+        self.config['metrics'] = metrics
 
     def predict(self, smiles: Union[str, npt.NDArray], uniprot: str) -> float:
         if type(smiles) is str:
@@ -99,35 +200,40 @@ class Model:
             fp = smiles
 
         if uniprot not in self.protModels:
-            if self.verbose: print('novel kinase target; fetching info from uniprot')
-            seqs = self.fetch_seqs([uniprot])
-            for uid, seq in seqs.items():
-                models = self.get_similar(seq)
-                self.protModels[uid] = {'models': models, 'seq': seq, 'direct': False}
+            if self.verbose: print(f'novel kinase target <{uniprot}>; fetching info from uniprot')
+            # a map of one UniProt to AA sequence
+            seqs = UniProtQuery([uniprot]).get()
+            uid, seq = next(iter(seqs.items()))
+            self.add_booster(uid, seq)
 
         return np.mean([m.predict(fp) for m in self.protModels[uniprot]['models']])
 
-    def predict_batch(self, smiles: Sequence[str], uniprot: Sequence[str]) -> List[float]:
+    def predict_batch(self, 
+        smiles: Sequence[str], 
+        uniprot: Sequence[str], 
+    ) -> List[float]:
+        ''' Predict a collection of [SMILES], [UniProt ID] at one time. 
+            Reduces API calls to UniProt if there are IDs without predictors
+        '''
+
         unique_smiles = set(smiles)
         novel_uniprot = set(uniprot).difference(set(self.protModels.keys()))
         if self.verbose:
-            print('total unique smiles', len(unique_smiles), '/', len(smiles))
-            print('total novel uniprot', len(novel_uniprot), '/', len(set(uniprot)), '/', len(uniprot))
+            print('unique smiles', len(unique_smiles), '/', len(smiles))
+            print('novel uniprot', len(novel_uniprot), '/', len(set(uniprot)), '/', len(uniprot))
 
         if len(novel_uniprot) > 0:
-            novel_seqs = self.fetch_seqs(novel_uniprot)
-            if self.verbose: print('got novel sequences from uniprot API')
+            novel_seqs = UniProtQuery(novel_uniprot).get(verbose=self.verbose)
+            if self.verbose: 
+                print('got novel sequences from uniprot API')
+            
             # Ideally this would all be done with multiprocessing...
             # but it doesn't seem to work on the grader...
-            # with multiprocessing.Pool(self.cores) as p:
-            #     models = p.map(self.get_similar, novel_seqs.values())
-            #     for (uid, seq), m in zip(novel_seqs.items(), models):
-            #         self.protModels[uid] = {'models': m, 'seq': seq}
-
             for uid, seq in novel_seqs.items():
-                models = self.get_similar(seq)
-                self.protModels[uid] = {'models': models, 'seq': seq, 'direct': False}
-            if self.verbose: print('found similar models for unique sequences')
+                self.add_booster(uid, seq)
+
+            if self.verbose: 
+                print('found similar models for unique sequences')
 
         fps = {smi: self.fingerprint(smi).reshape(1, -1) for smi in unique_smiles}
         fps = [fps[smi] for smi in smiles]
@@ -147,23 +253,37 @@ class Model:
 
         return np.array(fp, dtype=np.uint8)
 
-    def fetch_seqs(self, uids: Sequence[str]) -> Dict[str, str]:
-        url = 'https://rest.uniprot.org/uniprotkb/stream'
-        query = " OR ".join(f'(accession:{uid})' for uid in uids)
-        params = {
-            'query': query,
-            'fields': 'accession,sequence',
-            'format': 'tsv',
-        }
-        res = requests.get(url, params=params)
-        it = map(lambda l: l.strip().split('\t'), res.text.splitlines()[1:])
-        return {uid: seq for uid, seq in it}
+    # @staticmethod
+    # def fetch_seqs(uids: Sequence[str]) -> Dict[str, str]:
+    #     ''' get a map of uids to AA sequence from UniProt API '''
+    #     url = 'https://rest.uniprot.org/uniprotkb/stream'
+    #     query = " OR ".join(f'(accession:{uid})' for uid in uids)
+    #     params = {
+    #         'query': query,
+    #         'fields': 'accession,sequence',
+    #         'format': 'tsv',
+    #     }
+    #     res = requests.get(url, params=params)
+    #     res.raise_for_status()
+    #     # if 429 (timeout? wait?)
+    #     # res.code
+    #     it = map(lambda l: l.strip().split('\t'), res.text.splitlines()[1:])
+    #     return {uid: seq for uid, seq in it}
+
+    def missing_boosters(self, uniprots: Sequence[str]) -> Set[str]:
+        ''' Check `uniprots` to find any UniProt IDs that do not have a booster '''
+        return {uid for uid in uniprots if uid not in self.protModels}
+    
+    def add_booster(self, uid: str, seq: str):
+        ''' Create an inferred booster for `uid` based on similarity of `seq` to XGBoost models '''
+        models = self.get_similar(seq)
+        self.protModels[uid] = {'models': models, 'seq': seq, 'direct': False}
 
     def get_similar(self, targetSeq: str) -> List[xgb.XGBRegressor]:
         # use only models that were trained, for now...
-        only_singles = lambda x: len(x['models']) == 1
+        only_trained = lambda x: x['direct']
         score_seq = lambda x: (self.aligner.score(targetSeq, x['seq']), x['models'][0])
-        itr = map(score_seq, filter(only_singles, self.protModels.values()))
+        itr = map(score_seq, filter(only_trained, self.protModels.values()))
 
         return [x[1] for x in heapq.nlargest(self.topK, itr, key=lambda x: x[0])]
 
@@ -179,7 +299,7 @@ class Model:
             # otherwise, pick the topK models that are closest to this one
             models = []
             for nnid in nns:
-                if nnid in self.protModels and len(self.protModels[nnid]['models']) == 1:
+                if nnid in self.protModels and self.protModels[nnid]['direct']:
                     models.append(self.protModels[nnid]['models'][0])
                 if len(models) >= self.topK: break;
 
@@ -197,10 +317,62 @@ class Model:
         return boosters, inferred
 
     def __str__(self):
-        return f'''\
-        '''
+        c = self.config
+        fp = c['fingerprints']
+        C = 'C' if fp['useChirality'] else ''
+        F = 'F' if fp['useFeatures'] else ''
+        CON = '+' if C or F else ''
+        b, i = self.describe()
+        acts = ', '.join(c['activityTypes'])
+
+        return f"Model <{fp['bitSize']}b ECFP{fp['radius']}{CON}{C}{F} over {acts}>: {b} trees ({i} inferred)"
 
 
+class UniProtQuery():
+    '''
+        Use the paginated search for UniProt, as the stream errors unpredictibly yet frequently.
+
+        Adapted from: https://www.uniprot.org/help/api_queries
+    '''
+    def __init__(self, uids: Sequence[str]):
+        self.url = 'https://rest.uniprot.org/uniprotkb/search'
+        self.params = {
+            'query': " OR ".join(f'(accession:{uid})' for uid in uids),
+            'fields': 'accession,sequence',
+            'format': 'tsv',
+            'size': 500,
+        }
+        self.reNextLink = re.compile(r'<(.+)>; rel="next"')
+        self.retries = Retry(total=5, backoff_factor=0.25, status_forcelist=[500, 502, 503, 504])
+    
+    def get_next_link(self, headers) -> Optional[str]:
+        if 'Link' in headers:
+            match = self.reNextLink(headers['Link'])
+            if match:
+                return match.group(1)
+        return None
+
+    def get_batch(self, session: requests.Session):
+        batch_url = self.url + '?' + urllib.parse.urlencode(self.params)
+        while batch_url:
+            res = session.get(batch_url)
+            res.raise_for_status()
+            total = res.headers['x-total-results']
+            yield res, total
+            batch_url = self.get_next_link(res.headers)
+
+    def get(self, verbose=False) -> Dict[str, str]:
+        with requests.Session() as s:
+            s.mount('https://', HTTPAdapter(max_retries=self.retries))
+            output = []
+            for batch, total in self.get_batch(s):
+                output.extend(map(lambda l: l.strip().split('\t'), batch.text.splitlines()[1:]))
+                if verbose: print(len(output), '/', total)
+
+            return {uid: seq for uid, seq in output}
+
+
+################# CLI Interface for Predictions #####################
 if __name__ == '__main__':
     import argparse
     import fsspec
@@ -210,22 +382,67 @@ if __name__ == '__main__':
         p = argparse.ArgumentParser('Run model in `tarfile` on `datafile`')
         p.add_argument('input', help='input columnar data file with SMILES and UniProt IDs')
         p.add_argument('output', nargs='?', default=None, help="save predictions to space-separated text file if present")
-        p.add_argument('--tarfile', '-t', default='gs://mwc10-mscbio2066/model_hu-fp2048r3-KDKI.tar.gz', help='tar containing model info')
+        p.add_argument('--tarfile', '-t', action='append', help='tar containing model info (Path, [MinCmpds,] [K])' )
         p.add_argument('--eval', '-e', action='store_true')
-        p.add_argument('--cmin', '-c', type=int, default=16, help='min amount of compounds used to train a kinase GBF')
-        p.add_argument('--rmin', '-r', type=float, default=None)
-        p.add_argument('-k', type=int, default=3, help='Infer from K models if kinase not directly trained')
-        p.add_argument('--scores', '-s', default=None, help='precalculated kinase similiarities')
+        p.add_argument('--scores', '-s', default=None, help='precalculated kinase similarities')
         return p.parse_args()
     
+    def try_none(x, idx, wrap=int):
+        try:
+            return wrap(x[idx])
+        except:
+            return None
+
+    def extract_model_params(s):
+        ''' Parse CLI string "ModelPath,Option<K>,Option<MinCmpd>,Option<MinR2>" '''
+        parts = s.split(',')
+        n = parts[0]
+        k = try_none(parts, 1)
+        c = try_none(parts, 2)
+        r = try_none(parts, 3, float)
+
+        return n, k, c, r  
+
     def get_num_cores():
         try:
             return len(os.sched_getaffinity(0))
         except:
             return multiprocessing.cpu_count()
+
+    def create_model(scores, m):
+        file, k, cmin, rmin = m
+        with fsspec.open(file) as tar:
+            return Model(tar, cores, scores=scores, min_cmpds=cmin, metric_val=rmin, similar_k=k)
+
+    # DEFAULT_MODELS = [
+    #     # model, min_compounds, topK
+    #     ('gs://mwc10-mscbio2066/model_hu-fp2048r3-KDKI.tar.gz', 16, 3)
+    # ]
+    
+    # DEFAULT_MODELS = [
+    #     # model, k, min_compounds, min_r2
+    #     ('test/hide/model_hu-fp2048r1-KDKIEC50IC50.tar.gz', 3, 30, -0.5), 
+    #     ('test/model_hu-fp2048r1-KDKIEC50IC50-CF.tar.gz', 1, 30, -0.5), 
+    #     ('test/model_hu-fp2048r2-KDKIEC50IC50-CF.tar.gz', 3, 30, -0.5),
+
+    #     ('test/hide/model_hu-fp2048r2-KDKI.tar.gz', 5, 15, -0.5),
+    #     ('test/model_hu-fp2048r2-KDKI-CF.tar.gz', 5, 15, -0.5), 
+    # ]
+
+    DEFAULT_MODELS = [
+        # model, k, min_compounds, min_r2
+        ('gs://mwc10-mscbio2066/model_hu-fp2048r1-KDKIEC50IC50.tar.gz', 3, 30, -0.5), 
+        ('gs://mwc10-mscbio2066/model_hu-fp2048r1-KDKIEC50IC50-CF.tar.gz', 1, 30, -0.5), 
+        ('gs://mwc10-mscbio2066/model_hu-fp2048r2-KDKIEC50IC50-CF.tar.gz', 3, 30, -0.5),
+        ('gs://mwc10-mscbio2066/model_hu-fp2048r2-KDKI.tar.gz', 5, 15, -0.5),
+        ('gs://mwc10-mscbio2066/model_hu-fp2048r2-KDKI-CF.tar.gz', 5, 15, -0.5), 
+    ]
     
     args = cli()
     cores = get_num_cores()
+    modelSettings = list(map(extract_model_params, args.tarfile)) if args.tarfile else DEFAULT_MODELS
+
+    print(modelSettings)
 
     df = pd.read_csv(args.input, sep=' ').dropna(axis='columns', how='all')
 
@@ -238,23 +455,23 @@ if __name__ == '__main__':
         print('parsed pre-calculated scores')
     else:
         scores = None
-    
-    print(f'creating model for {args.tarfile}')
-    with fsspec.open(args.tarfile) as tar:
-        m = Model(tar, cores, scores=scores, min_cmpds=args.cmin, metric_val=args.rmin, similar_k=args.k)
-    
-    predictions = m.predict_batch(df['SMILES'], df['UniProt'])
-    df['Predicted'] = pd.Series(np.array(predictions), dtype=float)
-    # test = df.with_columns([pl.Series('Predict pKd', predictions, dtype=pl.Float64)])
+
+    print('creating ensemble model')
+    ensemble = ModelEnsemble(modelSettings, cores, scores)
+    avg_predict, predictions = ensemble.predict(df['SMILES'], df['UniProt'])
+
+    df['Predicted'] = pd.Series(avg_predict)
     if args.output is not None:
         df.to_csv(args.output, sep=' ', float_format='%.4f', index=False)
         print('saved predictions to ', args.output)
 
     if 'pKd' in df and args.eval:
-        print(df)
-        res = spearmanr(df['Predicted'], df['pKd'])
-        corr, p = res.statistics, res.pvalue
+        for m, pred in zip(ensemble.ensemble, predictions):
+            res = spearmanr(pred, df['pKd'])
+            print(m)
+            print('\t',res) 
+
+        res = spearmanr(avg_predict, df['pKd'])
+        corr, p = res.statistic, res.pvalue
         print(f'Correlation with labels in input:\t{corr:.4f} +/- {p:.4f}')
     
-    print(m.describe())
-    print(m.config)
