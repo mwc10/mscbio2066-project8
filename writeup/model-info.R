@@ -2,7 +2,7 @@ library(tidyverse)
 library(ggplot2)
 
 # Final Graphs.v2.final.final
-all <- read_csv('../data/eval/results-everything.csv')
+all <- read_csv('results-everything.csv')
 å
 # Find Highest Performing Fingerprint radius and dataset on entire validation set
 all %>%
