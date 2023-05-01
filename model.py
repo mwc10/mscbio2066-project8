@@ -64,50 +64,53 @@ class ModelEnsemble:
         '''
 
         novel_uids = set.union(*[m.missing_boosters(uids) for m in self.ensemble])
-        if len(novel_uids) > 0:
-            if self.verbose:
-                print('found', len(novel_uids), 'novel UniProt IDs')
-            novel_seqs = UniProtQuery(novel_uids).get(verbose=self.verbose)
-            if self.verbose:
-                print('prefetched', len(novel_seqs), 'novel UniProt/Sequence pairs')
-            
-            trained = {}
-            for m in self.ensemble:
-                for uid, info in m.protModels.items():
-                    if info['direct'] and uid not in trained:
-                        trained[uid] = info['seq']
-            if self.verbose:
-                print('built all trained UniProt pairs')
-            
-            # novel_scores: Dict[str, List[str]] = {}
-            # for uid, target in novel_seqs.items():
-            #     scores = [(quid, self.aligner.score(target, query)) for quid, query in trained.items()]
-            #     scores.sort(reverse=True, key=lambda x: x[1])
-            #     scores = [p[0] for p in scores]
-            #     novel_scores[uid] = scores
-            #     if self.verbose: print('scored', uid)
+        if len(novel_uids) == 0:
+            return None
+        
+        if self.verbose:
+            print('found', len(novel_uids), 'novel UniProt IDs')
+        novel_seqs = UniProtQuery(novel_uids).get(verbose=self.verbose)
+        if self.verbose:
+            print('fetched', len(novel_seqs), 'novel sequences from uniprot')
+        
+        queries = {}
+        for m in self.ensemble:
+            for uid, info in m.protModels.items():
+                if info['direct'] and uid not in queries:
+                    queries[uid] = info['seq']
+        if self.verbose:
+            print('collected sequences from all trained kinase XGB models')
+        
 
-            with multiprocessing.Pool(self.cores) as p:
-                itr = p.imap_unordered(
-                    find_uid_nn, 
-                    zip(novel_seqs.items(), cycle([trained]), cycle([self.aligner]), cycle([self.verbose]))
-                )
-                novel_scores = dict(itr)
-            
-            if self.verbose: print(len(novel_scores), 'scored sequences')
+        with multiprocessing.Pool(self.cores) as p:
+            itr = p.imap_unordered(
+                _find_uid_nn, 
+                zip(novel_seqs.items(), cycle([queries]), cycle([self.aligner]), cycle([self.verbose]))
+            )
+            novel_scores = dict(itr)
+        
+        if self.verbose: print(len(novel_scores), 'scored novel sequences')
 
-            for m in self.ensemble:
-                m.use_precalced(novel_scores)
+        for m in self.ensemble:
+            m.use_precalced(novel_scores)
 
-def find_uid_nn(args) -> Tuple[str, List[str]]:
-        (uid, target), queries, aligner, verbose = args
-        scores = [(quid, aligner.score(target, query)) for quid, query in queries.items()]
-        scores.sort(reverse=True, key=lambda x: x[1])
-        scores = [x[0] for x in scores]
+def _find_uid_nn(args) -> Tuple[str, List[str]]:
+    ''' 
+    Args: target: (ID, Seq), 
+        queries: Map<ID, Seq>, 
+        aligner: PairwiseAligner, 
+        verbose: bool
+    Returns: ranked list of the nearest neighbors for `target` in `queries` using `aligner` 
+    Top-level function for multiprocessing
+    '''
+    (uid, target), queries, aligner, verbose = args
+    scores = [(quid, aligner.score(target, query)) for quid, query in queries.items()]
+    scores.sort(reverse=True, key=lambda x: x[1])
+    scores = [x[0] for x in scores]
 
-        if verbose: print('scored', uid, '\t', scores[:5])
+    if verbose: print('scored', uid, '\t', scores[:5])
 
-        return uid, scores
+    return uid, scores
     
 class Model:
     def __init__(self,
@@ -138,8 +141,6 @@ class Model:
         # a 'config.json' with basic info about the model and the fingerprinting parameters
         # finally, there is a folder with XGBoost .ubj files for each uniprot id
         with tarfile.open(**openParams) as tf:
-            # ubj_bytes = lambda p: bytearray(tf.extractfile(p).read())
-            # configure = lambda tup: (tup[0], {'models': [load_model(ubj_bytes(tup[1]))], 'seq': tup[2], 'direct': True})
             def ubj_bytes(p):
                 ''' get the decompressed UBJ bytes from the tar.gz file '''
                 return bytearray(tf.extractfile(p).read())
@@ -151,6 +152,7 @@ class Model:
                     'direct': True
                 }
                 return (uid, value)
+            
             # read model information csv from tar.gz
             df = pd.read_csv(tf.extractfile('info.csv'))
 
@@ -253,23 +255,6 @@ class Model:
 
         return np.array(fp, dtype=np.uint8)
 
-    # @staticmethod
-    # def fetch_seqs(uids: Sequence[str]) -> Dict[str, str]:
-    #     ''' get a map of uids to AA sequence from UniProt API '''
-    #     url = 'https://rest.uniprot.org/uniprotkb/stream'
-    #     query = " OR ".join(f'(accession:{uid})' for uid in uids)
-    #     params = {
-    #         'query': query,
-    #         'fields': 'accession,sequence',
-    #         'format': 'tsv',
-    #     }
-    #     res = requests.get(url, params=params)
-    #     res.raise_for_status()
-    #     # if 429 (timeout? wait?)
-    #     # res.code
-    #     it = map(lambda l: l.strip().split('\t'), res.text.splitlines()[1:])
-    #     return {uid: seq for uid, seq in it}
-
     def missing_boosters(self, uniprots: Sequence[str]) -> Set[str]:
         ''' Check `uniprots` to find any UniProt IDs that do not have a booster '''
         return {uid for uid in uniprots if uid not in self.protModels}
@@ -296,7 +281,7 @@ class Model:
         for uid, nns in scores.items():
             # there is an XGBoost tree for this kinase
             if uid in self.protModels: continue;
-            # otherwise, pick the topK models that are closest to this one
+            # otherwise, pick the topK directly trained models that are closest to this one
             models = []
             for nnid in nns:
                 if nnid in self.protModels and self.protModels[nnid]['direct']:
@@ -330,7 +315,8 @@ class Model:
 
 class UniProtQuery():
     '''
-        Use the paginated search for UniProt, as the stream errors unpredictibly yet frequently.
+        Use the paginated search for UniProt, 
+        as the stream API errors unpredictibly yet frequently.
 
         Adapted from: https://www.uniprot.org/help/api_queries
     '''
@@ -362,6 +348,7 @@ class UniProtQuery():
             batch_url = self.get_next_link(res.headers)
 
     def get(self, verbose=False) -> Dict[str, str]:
+        ''' Returns: Map<UniProt ID, Seq> '''
         with requests.Session() as s:
             s.mount('https://', HTTPAdapter(max_retries=self.retries))
             output = []
@@ -382,7 +369,7 @@ if __name__ == '__main__':
         p = argparse.ArgumentParser('Run model in `tarfile` on `datafile`')
         p.add_argument('input', help='input columnar data file with SMILES and UniProt IDs')
         p.add_argument('output', nargs='?', default=None, help="save predictions to space-separated text file if present")
-        p.add_argument('--tarfile', '-t', action='append', help='tar containing model info (Path, [MinCmpds,] [K])' )
+        p.add_argument('--tarfile', '-t', action='append', help='tar containing model info (Path,[K],[MinCmpds],[MinR2])' )
         p.add_argument('--eval', '-e', action='store_true')
         p.add_argument('--scores', '-s', default=None, help='precalculated kinase similarities')
         return p.parse_args()
@@ -414,21 +401,6 @@ if __name__ == '__main__':
         with fsspec.open(file) as tar:
             return Model(tar, cores, scores=scores, min_cmpds=cmin, metric_val=rmin, similar_k=k)
 
-    # DEFAULT_MODELS = [
-    #     # model, min_compounds, topK
-    #     ('gs://mwc10-mscbio2066/model_hu-fp2048r3-KDKI.tar.gz', 16, 3)
-    # ]
-    
-    # DEFAULT_MODELS = [
-    #     # model, k, min_compounds, min_r2
-    #     ('test/hide/model_hu-fp2048r1-KDKIEC50IC50.tar.gz', 3, 30, -0.5), 
-    #     ('test/model_hu-fp2048r1-KDKIEC50IC50-CF.tar.gz', 1, 30, -0.5), 
-    #     ('test/model_hu-fp2048r2-KDKIEC50IC50-CF.tar.gz', 3, 30, -0.5),
-
-    #     ('test/hide/model_hu-fp2048r2-KDKI.tar.gz', 5, 15, -0.5),
-    #     ('test/model_hu-fp2048r2-KDKI-CF.tar.gz', 5, 15, -0.5), 
-    # ]
-
     DEFAULT_MODELS = [
         # model, k, min_compounds, min_r2
         ('gs://mwc10-mscbio2066/model_hu-fp2048r1-KDKIEC50IC50.tar.gz', 3, 30, -0.5), 
@@ -452,7 +424,7 @@ if __name__ == '__main__':
         import polars as pl
         dfScores = pl.read_parquet(args.scores)
         scores = {uid: nn for uid, _, nn in zip(*tuple(dfScores.to_dict().values()))}
-        print('parsed pre-calculated scores')
+        print('parsed pre-calculated kinase similarity scores')
     else:
         scores = None
 
