@@ -12,7 +12,7 @@ import sys
 import argparse
 import os
 import multiprocessing
-from typing import Dict, Tuple, List, Optional
+from typing import Dict, Tuple, Optional
 from pathlib import Path
 
 MIN_COMPOUNDS = 10

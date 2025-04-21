@@ -401,20 +401,70 @@ if __name__ == '__main__':
         with fsspec.open(file) as tar:
             return Model(tar, cores, scores=scores, min_cmpds=cmin, metric_val=rmin, similar_k=k)
 
+    # DEFAULT_MODELS = [
+    #     # model, k, min_compounds, min_r2
+    #     ('gs://mwc10-mscbio2066/model_hu-fp2048r1-KDKIEC50IC50.tar.gz', 3, 30, -0.5), 
+    #     ('gs://mwc10-mscbio2066/model_hu-fp2048r1-KDKIEC50IC50-CF.tar.gz', 1, 30, -0.5), 
+    #     ('gs://mwc10-mscbio2066/model_hu-fp2048r2-KDKIEC50IC50-CF.tar.gz', 3, 30, -0.5),
+    #     ('gs://mwc10-mscbio2066/model_hu-fp2048r2-KDKI.tar.gz', 5, 15, -0.5),
+    #     ('gs://mwc10-mscbio2066/model_hu-fp2048r2-KDKI-CF.tar.gz', 5, 15, -0.5),
+    # ]
+
+
+    # Try switching to sharepoint
+    # check if model already in local dr
+    # if not download from sharepoint
+    SHARE_BASEURL = "https://pitt-my.sharepoint.com/:u:/g/personal/alo90_pitt_edu/EQbU-cqW8BpGpPIuqdp3Jw4Bc4eV-E1oqmUUvTdRAsHuPQ?e=FlXOVE"
+
+    # 2025 Code for downloading from sharepoint
+    def get_sharepoint(url,fname):
+        '''fetch a world readable sharepoint file shared via url'''
+        s = requests.Session()
+        r = s.get(url)
+        if not r:
+            return False
+        m = re.search(r'FileRef":\s+"(.*?)"',r.text)
+        if not m:
+            return False
+        path = "'"+m.group(1).replace('\\u002f','/')+"'"
+        path = urllib.parse.quote_plus(path,safe='').replace('.','%2E').replace('_','%5F')
+        comp = url.split('/')
+        durl = f'{comp[0]}//{comp[2]}/{comp[5]}/{comp[6]}/_api/web/GetFileByServerRelativePath(DecodedUrl=@a1)/OpenBinaryStream?@a1={path}'
+        r = s.get(durl,stream=True)
+        if not r:
+            return False
+        with open(fname, 'wb') as fd:
+            for chunk in r.iter_content(chunk_size=128):
+                fd.write(chunk)
+        return True
+    
+    def download_models_if_needed(models: list[tuple[str]]): 
+        for settings in models:
+            fname = settings[0]
+            if Path(fname).exists():
+                continue
+
+            if not get_sharepoint(SHARE_BASEURL, "pretrain_combo.tar.gz"):
+                raise f"Couldn't download <{fname}> from sharepoint"
+            else:
+                print(f"successfully downloaded model: {fname}")
+
+        return True
+
+
     DEFAULT_MODELS = [
         # model, k, min_compounds, min_r2
-        ('gs://mwc10-mscbio2066/model_hu-fp2048r1-KDKIEC50IC50.tar.gz', 3, 30, -0.5), 
-        ('gs://mwc10-mscbio2066/model_hu-fp2048r1-KDKIEC50IC50-CF.tar.gz', 1, 30, -0.5), 
-        ('gs://mwc10-mscbio2066/model_hu-fp2048r2-KDKIEC50IC50-CF.tar.gz', 3, 30, -0.5),
-        ('gs://mwc10-mscbio2066/model_hu-fp2048r2-KDKI.tar.gz', 5, 15, -0.5),
-        ('gs://mwc10-mscbio2066/model_hu-fp2048r2-KDKI-CF.tar.gz', 5, 15, -0.5), 
+        ('pretrain_combo.tar.gz', 10, 100, -0.5), 
     ]
     
     args = cli()
     cores = get_num_cores()
     modelSettings = list(map(extract_model_params, args.tarfile)) if args.tarfile else DEFAULT_MODELS
 
-    print(modelSettings)
+    for settings in modelSettings:
+        print(settings)
+     
+    download_models_if_needed(modelSettings)
 
     df = pd.read_csv(args.input, sep=' ').dropna(axis='columns', how='all')
 

@@ -7,3 +7,4 @@ data/
 test/
 *.db
 *.pkl
+pretrain_combo.tar.gz
